@@ -37,6 +37,7 @@ import socket
 import json
 import base64
 import copy
+import threading
 
 # Packages
 import numpy
@@ -165,7 +166,7 @@ class InstrumentAgent(ResourceAgent):
         
         # Data buffers for each stream.
         self._stream_buffers = {}
-        
+        self._lock = {}
         # Publisher timer greenlets for stream buffering.
         self._stream_greenlets = {}
         
@@ -844,7 +845,7 @@ class InstrumentAgent(ResourceAgent):
         
         try:
             stream_name = val['stream_name']
-            self._stream_buffers[stream_name].insert(0,val)
+            self._buffer_sample(stream_name, val)
         except KeyError:
             log.error('Instrument agent %s received sample with bad \
                 stream name %s.', self._proc_name, stream_name)
@@ -857,14 +858,22 @@ class InstrumentAgent(ResourceAgent):
             if state != ResourceAgentState.STREAMING or pubfreq == 0:
                 self._publish_stream_buffer(stream_name)
 
+    def _buffer_sample(self, name, value):
+        """ threadsafe add instrument packet to buffer """
+        with self._lock[name]:
+            self._stream_buffers[name].insert(0,value)
+
+    def _get_buffered_samples(self, name):
+        """ threadsafe extraction and removal of buffered values """
+        with self._lock[name]:
+            out = self._stream_buffers[name][:]
+            del self._stream_buffers[name][:]
+        return out
+
     def _process_alarms(self, val):
-        """
-        """
-        
         try:
             stream_name = val['stream_name']
             values = val['values']
-        
         except KeyError:
             log.error('Tomato missing stream_name or values keys. Could not process alarms.')
             return
@@ -886,73 +895,54 @@ class InstrumentAgent(ResourceAgent):
                                 origin=self._resource_id,
                                 origin_type=self.ORIGIN_TYPE,
                                 **event_data)
-        
+
+    def _get_buffer_as_granule(self, stream_name):
+        """ convert buffered instrument packets to a granule """
+        vals = self._get_buffered_samples(stream_name)
+        if not vals:
+            return
+
+        count = len(vals)
+        data_arrays = {}
+
+        stream_def = self._stream_defs[stream_name]
+        rdt = RecordDictionaryTool(stream_definition_id=stream_def)
+        for x in rdt.fields:
+            data_arrays[x] = [None]*count
+
+        for i in xrange(count):
+            tomato = vals[i]
+            for (tk, tv) in tomato.iteritems():
+                if tk == 'values':
+                    for tval_dict in tv:
+                        tval_id = tval_dict['value_id']
+                        if tval_id in rdt:
+                            tval_val = tval_dict['value']
+                            if tval_dict.get('binary', None):
+                                tval_val = base64.b64decode(tval_val)
+                            data_arrays[tval_id][i] = tval_val
+
+                            self._eval_alarms(stream_name, tval_id, tval_val)
+
+                elif tk in rdt:
+                    data_arrays[tk][i] = tv
+                    if tk == 'driver_timestamp':
+                        data_arrays['time'][i] = tv
+
+        for (k,v) in data_arrays.iteritems():
+            rdt[k] = numpy.array(v)
+
+        log.info('Outgoing granule: %s' % ['%s: %s'%(k,v) for k,v in rdt.iteritems()])
+        return rdt.to_granule(data_producer_id=self.resource_id)
+
     def _publish_stream_buffer(self, stream_name):
-        """
-        """
-        
-        """
-        ['quality_flag', 'preferred_timestamp', 'port_timestamp', 'lon', 'raw', 'internal_timestamp', 'time', 'lat', 'driver_timestamp']
-        ['quality_flag', 'preferred_timestamp', 'temp', 'density', 'port_timestamp', 'lon', 'salinity', 'pressure', 'internal_timestamp', 'time', 'lat', 'driver_timestamp', 'conductivit
-        
-        {"driver_timestamp": 3564867147.743795, "pkt_format_id": "JSON_Data", "pkt_version": 1, "preferred_timestamp": "driver_timestamp", "quality_flag": "ok", "stream_name": "raw",
-        "values": [{"binary": true, "value": "MzIuMzkxOSw5MS4wOTUxMiwgNzg0Ljg1MywgICA2LjE5OTQsIDE1MDUuMTc5LCAxOSBEZWMgMjAxMiwgMDA6NTI6Mjc=", "value_id": "raw"}]}', 'time': 1355878347.744123}
-        
-        {"driver_timestamp": 3564867147.743795, "pkt_format_id": "JSON_Data", "pkt_version": 1, "preferred_timestamp": "driver_timestamp", "quality_flag": "ok", "stream_name": "parsed",
-        "values": [{"value": 32.3919, "value_id": "temp"}, {"value": 91.09512, "value_id": "conductivity"}, {"value": 784.853, "value_id": "pressure"}]}', 'time': 1355878347.744127}
-        
-        {'quality_flag': [u'ok'], 'preferred_timestamp': [u'driver_timestamp'], 'port_timestamp': [None], 'lon': [None], 'raw': ['-4.9733,16.02390, 539.527,   34.2719, 1506.862, 19 Dec 2012, 01:03:07'],
-        'internal_timestamp': [None], 'time': [3564867788.0627117], 'lat': [None], 'driver_timestamp': [3564867788.0627117]}
-        
-        {'quality_flag': [u'ok'], 'preferred_timestamp': [u'driver_timestamp'], 'temp': [-4.9733], 'density': [None], 'port_timestamp': [None], 'lon': [None], 'salinity': [None], 'pressure': [539.527],
-        'internal_timestamp': [None], 'time': [3564867788.0627117], 'lat': [None], 'driver_timestamp': [3564867788.0627117], 'conductivity': [16.0239]}
-        """
+        """ publish buffer contents as a single granule """
 
         try:
-            stream_def = self._stream_defs[stream_name]
-            rdt = RecordDictionaryTool(stream_definition_id=stream_def)
-            publisher = self._data_publishers[stream_name]
-    
-            buf_len = len(self._stream_buffers[stream_name])
-            if buf_len == 0:
-                return
-            
-            vals = []
-            for x in range(buf_len):
-                vals.append(self._stream_buffers[stream_name].pop())
-    
-            data_arrays = {}
-            for x in rdt.fields:
-                data_arrays[x] = [None for y in range(buf_len)]
-
-            for i in range(buf_len):
-                tomato = vals[i]
-                for (tk, tv) in tomato.iteritems():
-                    if tk == 'values':
-                        for tval_dict in tv:
-                            tval_id = tval_dict['value_id']
-                            if tval_id in rdt:
-                                tval_val = tval_dict['value']
-                                if tval_dict.get('binary', None):
-                                    tval_val = base64.b64decode(tval_val)
-                                data_arrays[tval_id][i] = tval_val
-                                
-                                self._eval_alarms(stream_name, tval_id, tval_val)
-                                
-                    elif tk in rdt:
-                        data_arrays[tk][i] = tv
-                        if tk == 'driver_timestamp':
-                            data_arrays['time'][i] = tv    
-            
-            for (k,v) in data_arrays.iteritems():
-                rdt[k] = numpy.array(v)
-            
-            log.info('Outgoing granule: %s' % ['%s: %s'%(k,v) for k,v in rdt.iteritems()])
-            g = rdt.to_granule(data_producer_id=self.resource_id)
-            publisher.publish(g)
-            log.info('Instrument agent %s published data granule on stream %s.',
-                self._proc_name, stream_name)
-            
+            g = self._get_buffer_as_granule(stream_name)
+            if g:
+                self._data_publishers[stream_name].publish(g)
+                log.info('Instrument agent %s published data granule on stream %s.', self._proc_name, stream_name)
         except:
             log.exception('Instrument agent %s could not publish data on stream %s.',
                 self._proc_name, stream_name)
@@ -1295,7 +1285,7 @@ class InstrumentAgent(ResourceAgent):
                 else:
                     self._stream_greenlets[stream_name] = None
                     self._stream_buffers[stream_name] = []
-                    
+                    self._lock[stream_name] = Lock()
                     pubfreq = stream_config.get('pubfreq', 0)
                     if not isinstance(pubfreq, int) or pubfreq <0:
                         log.error('pubfreq config for stream %s not valid',
