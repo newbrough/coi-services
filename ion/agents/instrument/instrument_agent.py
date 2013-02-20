@@ -32,12 +32,14 @@ from pyon.core.exception import NotFound
 from pyon.core.exception import ServerError
 from pyon.core.exception import ResourceError
 
+from coverage_mode.coverage import SimplexCoverage, CRS, GridShape, AxisTypeEnum, MutabilityEnum, GridDomain
+
 # Standard imports.
 import socket
 import json
 import base64
 import copy
-import threading
+from threading import Lock
 
 # Packages
 import numpy
@@ -77,6 +79,8 @@ from ion.core.includes.mi import DriverProtocolState
 from ion.core.includes.mi import DriverParameter
 from interface.objects import StreamRoute
 from interface.objects import AgentCommand
+
+HDF5_LOCK = Lock()
 
 class InstrumentAgentState():
     UNINITIALIZED='xxx'
@@ -939,15 +943,54 @@ class InstrumentAgent(ResourceAgent):
         """ publish buffer contents as a single granule """
 
         try:
+# case 1: publish granules
             g = self._get_buffer_as_granule(stream_name)
             if g:
                 self._data_publishers[stream_name].publish(g)
                 log.info('Instrument agent %s published data granule on stream %s.', self._proc_name, stream_name)
+# case 2: publish raw
+#            g = self._get_buffered_samples(stream_name)
+#            if g:
+#                self._data_publishers[stream_name].publish(g)
+#                log.info('Instrument agent %s published data granule on stream %s.', self._proc_name, stream_name)
+# case 3: convert to granules, but do not publish
+#            g = self._get_buffer_as_granule(stream_name)
+# case 4: neither convert nor publish
+#            self._get_buffered_samples(stream_name)
+# case 5: convert and write as HDF5
+#            g = self._get_buffer_as_granule(stream_name)
+#            if g:
+#                self._write_hdf5(g)
         except:
-            log.exception('Instrument agent %s could not publish data on stream %s.',
-                self._proc_name, stream_name)
-        
-        
+            log.exception('Instrument agent %s could not publish data on stream %s.', self._proc_name, stream_name)
+
+    def _write_hdf5(self, granule):
+        rd = RecordDictionaryTool.load_from_granule(granule)
+        fields = rd.fields
+        size = len(rd)
+
+        tcrs = CRS([AxisTypeEnum.TIME])
+        scrs = CRS([AxisTypeEnum.LON, AxisTypeEnum.LAT, AxisTypeEnum.HEIGHT])
+        pdict = rd._pdict
+        tdom = GridDomain(GridShape('temporal', [0]), tcrs, MutabilityEnum.EXTENSIBLE)
+        sdom = GridDomain(GridShape('spatial', [0]), scrs, MutabilityEnum.IMMUTABLE) # Dimensionality is excluded for now
+        path = "/tmp/coverage"
+        guid = "123"
+
+        with HDF5_LOCK:
+            cov = SimplexCoverage(path, guid, name="sample_cov", parameter_dictionary=pdict, temporal_domain=tdom, spatial_domain=sdom)
+            for field in fields:
+                cov.set_parameter_values(field, rd[field])
+            cov.flush()
+
+#        from coverage_model.test.examples import emptysamplecov
+#        empty_cov = emptysamplecov()
+#        empty_cov.insert_timesteps(size)
+#        for field in fields:
+#            empty_cov.set_parameter_values(field, rd[field])
+#        empty_cov.flush()
+
+
     def _eval_alarms(self, stream_name, value_id, value):
         """
         """
