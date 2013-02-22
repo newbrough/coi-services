@@ -734,8 +734,7 @@ class InstrumentAgent(ResourceAgent):
             ts = evt['time']
             
         except KeyError, ValueError:
-            log.error('Instrument agent %s received driver event %s \
-                      has missing required fields.', self.id, str(evt))
+            log.error('Instrument agent %s received driver event %s has missing required fields.', self.id, str(evt))
             return
         
         if type == DriverAsyncEvent.STATE_CHANGE:
@@ -796,29 +795,26 @@ class InstrumentAgent(ResourceAgent):
                       self._proc_name)            
 
     def _async_driver_event_sample(self, val, ts):
-        """
-        """
-        # Publish sample on sample data streams.
-        """
-        quality_flag : ok
-        preferred_timestamp : driver_timestamp
-        stream_name : raw
-        pkt_format_id : JSON_Data
-        pkt_version : 1
-        values : [{u'binary': True, u'value_id': u'raw', u'value':
-            u'MTkuMDYxMiwzLjMzNzkxLCA0NDkuMDA1LCAgIDE0Ljg3MjksIDE1MDUuMTQ3L
-            CAwMSBGZWIgMjAwMSwgMDE6MDE6MDA='}]
+        """ handle one sample, forward to data stream """
 
-        quality_flag : ok
-        preferred_timestamp : driver_timestamp
-        stream_name : parsed
-        pkt_format_id : JSON_Data
-        pkt_version : 1
-        values : [{u'value_id': u'temp', u'value': 19.0612},
-            {u'value_id': u'conductivity', u'value': 3.33791},
-            {u'value_id': u'pressure', u'value': 449.005}]
-        """
-        
+#        quality_flag : ok
+#        preferred_timestamp : driver_timestamp
+#        stream_name : raw
+#        pkt_format_id : JSON_Data
+#        pkt_version : 1
+#        values : [{u'binary': True, u'value_id': u'raw', u'value':
+#            u'MTkuMDYxMiwzLjMzNzkxLCA0NDkuMDA1LCAgIDE0Ljg3MjksIDE1MDUuMTQ3L
+#            CAwMSBGZWIgMjAwMSwgMDE6MDE6MDA='}]
+#
+#        quality_flag : ok
+#        preferred_timestamp : driver_timestamp
+#        stream_name : parsed
+#        pkt_format_id : JSON_Data
+#        pkt_version : 1
+#        values : [{u'value_id': u'temp', u'value': 19.0612},
+#            {u'value_id': u'conductivity', u'value': 3.33791},
+#            {u'value_id': u'pressure', u'value': 449.005}]
+
         # If the sample event is encoded, load it back to a dict.
         if isinstance(val, str):
             val = json.loads(val)
@@ -827,9 +823,7 @@ class InstrumentAgent(ResourceAgent):
             stream_name = val['stream_name']
             self._buffer_sample(stream_name, val)
         except KeyError:
-            log.error('Instrument agent %s received sample with bad \
-                stream name %s.', self._proc_name, stream_name)
-
+            log.warning('Instrument agent %s received sample with bad stream name %s.', self._proc_name, stream_name)
         else:
             self._process_alarms(val)
             state = self._fsm.get_current_state()
