@@ -7,26 +7,27 @@
 @description Implementation of the UserNotificationService
 """
 
+import pprint
+import string
+import time
+from email.mime.text import MIMEText
+from datetime import datetime
+
 from pyon.core.exception import BadRequest, IonException, NotFound
 from pyon.core.bootstrap import CFG
 from pyon.util.log import log
 from pyon.util.containers import get_ion_ts
 from pyon.public import RT, PRED, get_sys_name, Container, OT, IonObject
 from pyon.event.event import EventPublisher, EventSubscriber
+from ion.services.dm.utility.uns_utility_methods import setting_up_smtp_client
+from ion.services.dm.utility.uns_utility_methods import calculate_reverse_user_info, _convert_to_human_readable
+
 from interface.services.dm.idiscovery_service import DiscoveryServiceClient
 from interface.services.coi.iresource_registry_service import ResourceRegistryServiceClient
 from interface.services.cei.iprocess_dispatcher_service import ProcessDispatcherServiceClient
 from interface.objects import ComputedValueAvailability, NotificationDeliveryModeEnum, ComputedListValue, DeviceStatusType
-
-import string
-import time
-from email.mime.text import MIMEText
-from datetime import datetime
-
-from interface.objects import ProcessDefinition, TemporalBounds 
+from interface.objects import ProcessDefinition, TemporalBounds
 from interface.services.dm.iuser_notification_service import BaseUserNotificationService
-from ion.services.dm.utility.uns_utility_methods import setting_up_smtp_client
-from ion.services.dm.utility.uns_utility_methods import calculate_reverse_user_info, _convert_to_human_readable
 
 
 """
@@ -255,21 +256,31 @@ class UserNotificationService(BaseUserNotificationService):
         #---------------------------------------------------------------------------------------------------
 
         # if the notification has already been registered, simply use the old id
-
         notification_id = self._notification_in_notifications(notification, self.notifications)
 
+        # since the notification has not been registered yet, register it and get the id
+
+        temporal_bounds = TemporalBounds()
+        temporal_bounds.start_datetime = get_ion_ts()
+        temporal_bounds.end_datetime = ''
+
         if not notification_id:
-
-            # since the notification has not been registered yet, register it and get the id
-            notification.temporal_bounds = TemporalBounds()
-            notification.temporal_bounds.start_datetime = get_ion_ts()
-            notification.temporal_bounds.end_datetime = ''
-
+            notification.temporal_bounds = temporal_bounds
             notification_id, _ = self.clients.resource_registry.create(notification)
-
             self.notifications[notification_id] = notification
         else:
-            log.debug("Notification object has already been created in resource registry before. No new id to be generated.")
+            log.debug("Notification object has already been created in resource registry before. No new id to be generated. notification_id: %s", notification_id)
+            # Read the old notification already in the resource registry
+            notification = self.clients.resource_registry.read(notification_id)
+
+            # Update the temporal bounds of the old notification resource
+            notification.temporal_bounds = temporal_bounds
+
+            # Update the notification in the resource registry
+            self.clients.resource_registry.update(notification)
+
+            log.debug("The temporal bounds for this resubscribed notification object with id: %s, is: %s", notification_id,notification.temporal_bounds)
+
 
         # Link the user and the notification with a hasNotification association
         assocs= self.clients.resource_registry.find_associations(subject=user_id,
@@ -589,6 +600,8 @@ class UserNotificationService(BaseUserNotificationService):
 
             spc_attrs = ["%s:%s" % (k, str(getattr(event, k))[:50]) for k in sorted(event.__dict__.keys()) if k not in ['_id', '_rev', 'type_', 'origin', 'origin_type', 'ts_created', 'base_types']]
             evt_computed.special_attributes = ", ".join(spc_attrs)
+
+            evt_computed.event_attributes_formatted = pprint.pformat(event.__dict__)
         except Exception as ex:
             log.exception("Error computing EventComputedAttributes for event %s" % event)
 
@@ -598,23 +611,48 @@ class UserNotificationService(BaseUserNotificationService):
         event_types = [event.type_] + event.base_types
         summary = ""
         if "ResourceLifecycleEvent" in event_types:
-            summary = "Resource %s (type %s) lifecycle state now: %s" % (event.origin, event.origin_type, event.new_state)
+            summary = "%s lifecycle state change: %s" % (event.origin_type, event.new_state)
         elif "ResourceModifiedEvent" in event_types:
-            summary = "Resource %s (type %s) modified: %s" % (event.origin, event.origin_type, event.sub_type)
+            summary = "%s modified: %s" % (event.origin_type, event.sub_type)
+
         elif "ResourceAgentStateEvent" in event_types:
-            summary = "Agent for resource %s (type %s) now in agent state: %s" % (event.origin, event.origin_type, event.state)
+            summary = "%s agent state change: %s" % (event.origin_type, event.state)
         elif "ResourceAgentResourceStateEvent" in event_types:
-            summary = "Agent for resource %s (type %s) now in resource state: %s" % (event.origin, event.origin_type, event.state)
+            summary = "%s agent resource state change: %s" % (event.origin_type, event.state)
         elif "ResourceAgentConfigEvent" in event_types:
-            summary = "Resource agent %s (type %s) agent config set: %s" % (event.origin, event.origin_type, event.config)
+            summary = "%s agent config set: %s" % (event.origin_type, event.config)
         elif "ResourceAgentResourceConfigEvent" in event_types:
-            summary = "Resource agent %s (type %s) resource config set: %s" % (event.origin, event.origin_type, event.config)
+            summary = "%s agent resource config set: %s" % (event.origin_type, event.config)
         elif "ResourceAgentCommandEvent" in event_types:
-            summary = "Resource agent %s (type %s) command %s (%s) executed. Result=%s" % (event.origin, event.origin_type, event.execute_command, event.command, event.result)
+            summary = "%s agent command '%s(%s)' succeeded: %s" % (event.origin_type, event.command, event.execute_command, "" if event.result is None else event.result)
+        elif "ResourceAgentErrorEvent" in event_types:
+            summary = "%s agent command '%s(%s)' failed: %s:%s (%s)" % (event.origin_type, event.command, event.execute_command, event.error_type, event.error_msg, event.error_code)
+        elif "ResourceAgentAsyncResultEvent" in event_types:
+            summary = "%s agent async command '%s(%s)' succeeded: %s" % (event.origin_type, event.command, event.desc, "" if event.result is None else event.result)
+
+        elif "ResourceAgentResourceCommandEvent" in event_types:
+            summary = "%s agent resource command '%s(%s)' executed: %s" % (event.origin_type, event.command, event.execute_command, "OK" if event.result is None else event.result)
         elif "DeviceStatusEvent" in event_types:
-            summary = "Resource %s (type %s) %s status change: %s" % (event.origin, event.origin_type, event.sub_type, DeviceStatusType._str_map.get(event.state,"???"))
+            summary = "%s '%s' status change: %s" % (event.origin_type, event.sub_type, DeviceStatusType._str_map.get(event.state,"???"))
         elif "DeviceOperatorEvent" in event_types or "ResourceOperatorEvent" in event_types:
-            summary = event.description
+            summary = "Operator entered: %s" % event.description
+
+        elif "OrgMembershipGrantedEvent" in event_types:
+            summary = "Joined Org '%s' as member" % (event.org_name)
+        elif "OrgMembershipCancelledEvent" in event_types:
+            summary = "Cancelled Org '%s' membership" % (event.org_name)
+        elif "UserRoleGrantedEvent" in event_types:
+            summary = "Granted %s in Org '%s'" % (event.role_name, event.org_name)
+        elif "UserRoleRevokedEvent" in event_types:
+            summary = "Revoked %s in Org '%s'" % (event.role_name, event.org_name)
+        elif "ResourceSharedEvent" in event_types:
+            summary = "%s shared in Org: '%s'" % (event.sub_type, event.org_name)
+        elif "ResourceUnsharedEvent" in event_types:
+            summary = "%s unshared in Org: '%s'" % (event.sub_type, event.org_name)
+        elif "ResourceCommitmentCreatedEvent" in event_types:
+            summary = "%s commitment created in Org: '%s'" % (event.commitment_type, event.org_name)
+        elif "ResourceCommitmentReleasedEvent" in event_types:
+            summary = "%s commitment released in Org: '%s'" % (event.commitment_type, event.org_name)
 
 #        if event.description and summary:
 #            summary = summary + ". " + event.description
@@ -894,6 +932,9 @@ class UserNotificationService(BaseUserNotificationService):
         search_origin = 'search "origin" is "%s" from "resources_index"' % resource_id
         ret_vals = self.discovery.parse(search_origin)
 
+        log.debug("Using discovery with search_string: %s", search_origin)
+        log.debug("_get_subscriptions() got ret_vals: %s", ret_vals )
+
         notifications_all = set()
         notifications_active = set()
 
@@ -911,7 +952,9 @@ class UserNotificationService(BaseUserNotificationService):
             notifications_all.update(notifs)
         else:
             for notif in notifs:
+                log.debug("Got the end_datetime here: notif.temporal_bounds.end_datetime = %s", notif.temporal_bounds.end_datetime)
                 if notif.temporal_bounds.end_datetime == '':
+                    log.debug("removing the notification: %s", notif._id)
                     # Add the active notification
                     notifications_active.add(notif)
 

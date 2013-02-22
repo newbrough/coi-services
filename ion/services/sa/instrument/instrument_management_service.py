@@ -7,7 +7,7 @@ __author__ = 'Maurice Manning, Ian Katz, Michael Meisinger'
 import os
 import pwd
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import tempfile
 
@@ -20,7 +20,8 @@ from pyon.ion.resource import ExtendedResourceContainer
 from pyon.util.ion_time import IonTime
 from pyon.public import LCE
 from pyon.public import RT, PRED, OT
-
+from pyon.util.containers import get_ion_ts
+from pyon.agent.agent import ResourceAgentState
 from coverage_model.parameter import ParameterDictionary
 
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
@@ -53,6 +54,8 @@ from ion.agents.port.port_agent_process import PortAgentProcess
 
 from interface.objects import AttachmentType, ComputedValueAvailability, ProcessDefinition, ComputedIntValue, StatusType, ProcessSchedule, ProcessRestartMode, ProcessQueueingMode
 from interface.services.sa.iinstrument_management_service import BaseInstrumentManagementService
+from ion.services.sa.observatory.observatory_management_service import INSTRUMENT_OPERATOR_ROLE, OBSERVATORY_OPERATOR_ROLE
+from pyon.core.governance.governance_controller import ORG_MANAGER_ROLE
 
 
 class InstrumentManagementService(BaseInstrumentManagementService):
@@ -378,7 +381,7 @@ class InstrumentManagementService(BaseInstrumentManagementService):
                 raise Inconsistent("Data Product should only have ONE Stream" + str(product_id))
 
             #get the  parameter dictionary for this stream
-            dataset_ids, _ = self.clients.resource_registry.find_objects(product_id, PRED.hasDataset, RT.DataSet, True)
+            dataset_ids, _ = self.clients.resource_registry.find_objects(product_id, PRED.hasDataset, RT.Dataset, True)
             #One data set per product ...for now.
             if not dataset_ids:
                 raise NotFound("No Dataset attached to this Data Product " + str(product_id))
@@ -957,28 +960,78 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
     ##
     ##
+    ##  PRECONDITION FUNCTIONS
+    ##
+    ##
+
+    def check_direct_access_policy(self, msg, headers):
+
+        try:
+            op, actor_id, actor_roles, resource_id = self.container.governance_controller.get_governance_resource_header_values(headers)
+        except Inconsistent, ex:
+            return False, ex.message
+
+        #The system actor can to anything
+        if self.container.governance_controller.is_system_actor(actor_id):
+            return True, ''
+
+        #TODO - this shared commitment might not be with the right Org - may have to relook at how this is working.
+        if not self.container.governance_controller.has_exclusive_resource_commitment(actor_id, resource_id):
+            return False, '%s(%s) has been denied since the user %s has not acquired the resource exclusively' % (self.name, op, actor_id)
+
+        return True, ''
+
+    def check_device_lifecycle_policy(self, msg, headers):
+
+        try:
+            op, actor_id, actor_roles, resource_id = self.container.governance_controller.get_governance_resource_header_values(headers)
+        except Inconsistent, ex:
+            return False, ex.message
+
+        #The system actor can to anything
+        if self.container.governance_controller.is_system_actor(actor_id):
+            return True, ''
+
+        if msg.has_key('lifecycle_event'):
+            lifecycle_event = msg['lifecycle_event']
+        else:
+            raise Inconsistent('%s(%s) has been denied since the lifecycle_event can not be found in the message'% (self.name, op))
+
+        orgs,_ = self.clients.resource_registry.find_subjects(RT.Org, PRED.hasResource, resource_id)
+        if not orgs:
+            return False, '%s(%s) has been denied since the resource id %s has not been shared with any Orgs' % (self.name, op, resource_id)
+
+        #Handle these lifecycle transitions first
+        if lifecycle_event == LCE.INTEGRATE or lifecycle_event == LCE.DEPLOY or lifecycle_event == LCE.RETIRE:
+
+            #Check across Orgs which have shared this device for role which as proper level to allow lifecycle transition
+            for org in orgs:
+                if self.container.governance_controller.has_org_role(actor_roles, org.name, [OBSERVATORY_OPERATOR_ROLE,ORG_MANAGER_ROLE]):
+                    return True, ''
+
+        else:
+
+            #The owner can do any of these other lifecycle transitions
+            is_owner = self.container.governance_controller.is_resource_owner(actor_id, resource_id)
+            if is_owner:
+                return True, ''
+
+            #TODO - this shared commitment might not be with the right Org - may have to relook at how this is working.
+            is_shared = self.container.governance_controller.has_shared_resource_commitment(actor_id, resource_id)
+
+            #Check across Orgs which have shared this device for role which as proper level to allow lifecycle transition
+            for org in orgs:
+                if self.container.governance_controller.has_org_role(actor_roles, org.name, [INSTRUMENT_OPERATOR_ROLE, OBSERVATORY_OPERATOR_ROLE,ORG_MANAGER_ROLE] ) and is_shared:
+                    return True, ''
+
+        return False, '%s(%s) has been denied since the user %s has not acquired the resource or is not the proper role for this transition: %s' % (self.name, op, actor_id, lifecycle_event)
+
+
+    ##
+    ##
     ##  DIRECT ACCESS
     ##
     ##
-
-    def check_exclusive_commitment(self, msg,  headers):
-        """
-        This function is used for governance validation for the request_direct_access and stop_direct_access operation.
-        """
-
-        actor_id = headers['ion-actor-id']
-        resource_id = msg['instrument_device_id']
-
-        commitment_status =  self.container.governance_controller.has_resource_commitments(actor_id, resource_id)
-
-        if not commitment_status.shared:
-            return False, '(execute_resource) has been denied since the user %s has not acquired the resource %s' % (actor_id, resource_id)
-
-        #Look for any active commitments that are exclusive - and only allow for exclusive commitment
-        if not commitment_status.exclusive:
-            return False, 'Direct Access Mode has been denied since the user %s has not acquired the resource %s exclusively' % (actor_id, resource_id)
-
-        return True, ''
 
     def request_direct_access(self, instrument_device_id=''):
         """
@@ -1856,9 +1909,37 @@ class InstrumentManagementService(BaseInstrumentManagementService):
             ret.value = 0 #todo: use ia_client
         return ret
 
+    def get_uptime(self, instrument_device_id):
+        ia_client, ret = self.obtain_agent_calculation(instrument_device_id, OT.ComputedIntValue)
 
-    # def get_uptime(self, device_id): - common to both instrument and platform, see below
+        if ia_client:
+            # Find events in the event repo that were published when changes of state occurred for the instrument
+            # The Instrument Agent publishes events of a particular type, ResourceAgentStateEvent, and origin_type. So we query the events db for those.
+            event_tuples = self.container.event_repository.find_events(origin=instrument_device_id, event_type='ResourceAgentStateEvent', descending=True)
 
+            recent_events = [tuple[2] for tuple in event_tuples]
+
+            # We assume below that the events have been sorted in time, with most recent events first in the list
+            for evt in recent_events:
+                log.debug("Got an event with event_state: %s", evt.state)
+                # These below are the possible new event states while taking the instrument off streaming mode
+                # This is info got from possible actions to wind down the instrument that one can take in the UI when the instrument is already streaming
+                not_streaming_states = [ResourceAgentState.COMMAND, ResourceAgentState.INACTIVE, ResourceAgentState.UNINITIALIZED]
+
+                if evt.state == ResourceAgentState.STREAMING: # "RESOURCE_AGENT_STATE_STREAMING"
+                    current_time = get_ion_ts()
+                    ret.value = current_time - evt.ts_created
+                    log.debug("Got most recent streaming event with ts_created:  %s. Got the current time: %s", evt.ts_created, current_time)
+                    log.debug("Returning the computed attribute: %s", ret)
+                    return ret
+                elif evt.state in not_streaming_states:
+                    log.debug("Got a most recent event state that : %s", evt.state)
+                    # The instrument has been recently shut down. This has happened recently and no need to look further whether it was streaming earlier
+                    ret.value = 0
+                    return ret
+
+            ret.value = 0
+        return ret
 
     #functions for INSTRUMENT computed attributes -- currently bogus values returned
 
@@ -1940,14 +2021,6 @@ class InstrumentManagementService(BaseInstrumentManagementService):
 
         return extended_platform
 
-    # The actual initiation of the deployment, calculated from when the deployment was activated
-    def get_uptime(self, device_id):
-        #used by both instrument device, platform device
-#        ia_client, ret = self.obtain_agent_calculation(instrument_device_id, OT.ComputedFloatValue)
-#        if ia_client:
-#            ret.value = 45.5 #todo: use ia_client
-#        return ret
-        return "0 days, 0 hours, 0 minutes"
 
     def get_data_product_parameters_set(self, resource_id=''):
         # return the set of data product with the processing_level_code as the key to identify

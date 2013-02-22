@@ -287,6 +287,30 @@ class UserNotificationEventsTest(PyonTestCase):
         dict(et='ResourceModifiedEvent', o='ID_1', ot='InstrumentDevice', st='CREATE',
             attr=dict(mod_type=1)),
 
+        dict(et='ResourceSharedEvent', o='ID_1', ot='Org', st='InstrumentDevice',
+            attr=dict(resource_id="ResID_1", org_name="Org_Name")),
+
+        dict(et='ResourceUnsharedEvent', o='ID_1', ot='Org', st='InstrumentDevice',
+            attr=dict(resource_id="ResID_1", org_name="Org_Name")),
+
+        dict(et='OrgMembershipGrantedEvent', o='ID_1', ot='Org', st='',
+            attr=dict(org_name="Org_Name")),
+
+        dict(et='OrgMembershipCancelledEvent', o='ID_1', ot='Org', st='',
+            attr=dict(org_name="Org_Name")),
+
+        dict(et='UserRoleGrantedEvent', o='ID_1', ot='Org', st='OBSERVATORY_OPERATOR',
+            attr=dict(actor_id="ActorID_1", org_name="Org_Name", role_name="OBSERVATORY_OPERATOR")),
+
+        dict(et='UserRoleRevokedEvent', o='ID_1', ot='Org', st='OBSERVATORY_OPERATOR',
+            attr=dict(actor_id="ActorID_1", org_name="Org_Name", role_name="OBSERVATORY_OPERATOR")),
+
+        dict(et='ResourceCommitmentCreatedEvent', o='ID_1', ot='Org', st='InstrumentDevice',
+            attr=dict(org_name="Org_Name", commitment_id="ComID_1", commitment_type="ResourceCommitment")),
+
+        dict(et='ResourceCommitmentReleasedEvent', o='ID_1', ot='Org', st='InstrumentDevice',
+            attr=dict(org_name="Org_Name", commitment_id="ComID_1", commitment_type="ResourceCommitment")),
+
         dict(et='ResourceAgentStateEvent', o='ID_1', ot='InstrumentDevice', st='',
             attr=dict(state="RESOURCE_AGENT_STATE_UNINITIALIZED")),
 
@@ -301,6 +325,20 @@ class UserNotificationEventsTest(PyonTestCase):
                 kwargs={},
                 command="execute_resource",
                 execute_command="DRIVER_EVENT_STOP_AUTOSAMPLE",
+                result=None)),
+
+        dict(et='ResourceAgentErrorEvent', o='ID_1', ot='InstrumentDevice', st='',
+            attr=dict(args=[],
+                kwargs={},
+                command="execute_resource",
+                execute_command="DRIVER_EVENT_STOP_AUTOSAMPLE",
+                error_type="BadRequest",
+                error_msg="Could not delete XYZ",
+                error_code=401)),
+
+        dict(et='ResourceAgentAsyncResultEvent', o='ID_1', ot='InstrumentDevice', st='',
+            attr=dict(command="execute_resource",
+                desc="DRIVER_EVENT_STOP_AUTOSAMPLE",
                 result=None)),
 
        dict(et='DeviceStatusEvent', o='ID_1', ot='PlatformDevice', st='input_voltage',
@@ -843,7 +881,7 @@ class UserNotificationIntTest(IonIntegrationTestCase):
         # read back the registered notification request objects
         notification_request_correct = self.rrc.read(notification_id_1)
 
-        self.assertEquals(reloaded_user_info[user_id]['notifications'], [notification_request_correct] )
+        self.assertEquals(reloaded_user_info[user_id]['notifications'][0].name, "notification_1" )
         self.assertEquals(reloaded_user_info[user_id]['notification_preferences'].delivery_mode, notification_preferences.delivery_mode )
         self.assertEquals(reloaded_user_info[user_id]['notification_preferences'].delivery_enabled, notification_preferences.delivery_enabled )
 
@@ -2471,4 +2509,88 @@ class UserNotificationIntTest(IonIntegrationTestCase):
 
             self.assertTrue(notific_in_db.origin_type == 'active_2' or notific_in_db.origin_type == 'past_2')
             self.assertTrue(notific_in_db.event_type== 'ResourceLifecycleEvent' or notific_in_db.event_type=='DetectionEvent')
+
+    @attr('LOCOINT')
+    @unittest.skipIf(not use_es, 'No ElasticSearch')
+    @unittest.skipIf(os.getenv('CEI_LAUNCH_TEST', False), 'Skip test while in CEI LAUNCH mode')
+    def test_delete_then_create_subscription(self):
+
+    # Test that the get_subscriptions works correctly after deleting a previous and then creating the same on again
+
+        #--------------------------------------------------------------------------------------
+        # create user with email address in RR
+        #--------------------------------------------------------------------------------------
+
+        user = UserInfo()
+        user.name = 'user_1'
+        user.contact.email = 'user_1@gmail.com'
+
+        user_id, _ = self.rrc.create(user)
+
+        #--------------------------------------------------------------------------------------
+        # Make a data product
+        #--------------------------------------------------------------------------------------
+        data_product_management = DataProductManagementServiceClient()
+        dataset_management = DatasetManagementServiceClient()
+        pubsub = PubsubManagementServiceClient()
+
+        pdict_id = dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
+        streamdef_id = pubsub.create_stream_definition(name="test_subscriptions", parameter_dictionary_id=pdict_id)
+
+        tdom, sdom = time_series_domain()
+        tdom, sdom = tdom.dump(), sdom.dump()
+
+        dp_obj = IonObject(RT.DataProduct,
+            name='DP1',
+            description='some new dp',
+            temporal_domain = tdom,
+            spatial_domain = sdom)
+
+        data_product_id = data_product_management.create_data_product(data_product=dp_obj, stream_definition_id=streamdef_id)
+
+        #--------------------------------------------------------------------------------------
+        # Make notification request objects - Remember to put names
+        #--------------------------------------------------------------------------------------
+
+        notification_request_1 = NotificationRequest(   name = "notification_1",
+            origin=data_product_id,
+            origin_type="type_1",
+            event_type='ResourceLifecycleEvent')
+
+        notification_id1 =  self.unsc.create_notification(notification=notification_request_1, user_id=user_id)
+
+        gevent.sleep(10)
+
+        notifs = self.unsc.get_subscriptions(resource_id=data_product_id)
+
+        self.assertEquals(len(notifs), 1)
+        notif = notifs[0]
+
+        self.assertEquals(notif.origin, data_product_id)
+        self.assertEquals(notif.event_type, "ResourceLifecycleEvent")
+        self.assertEquals(notif.name, "notification_1")
+
+        # Now delete the notification
+        self.unsc.delete_notification(notification_id1)
+
+        notifs = self.unsc.get_subscriptions(resource_id='instrument_1')
+
+        self.assertEquals(len(notifs), 0)
+
+        # Now use create notification using the same notification object of old
+
+        new_notif_id =  self.unsc.create_notification(notification=notification_request_1, user_id=user_id)
+
+        self.assertEquals(new_notif_id, notification_id1)
+        notifs = self.unsc.get_subscriptions(resource_id=data_product_id)
+
+        self.assertEquals(len(notifs), 1)
+        notif = notifs[0]
+
+        self.assertEquals(notif.origin, data_product_id)
+        self.assertEquals(notif.event_type, "ResourceLifecycleEvent")
+        self.assertEquals(notif.name, "notification_1")
+
+
+
 

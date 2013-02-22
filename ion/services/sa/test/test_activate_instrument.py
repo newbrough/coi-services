@@ -38,7 +38,7 @@ from ion.services.dm.utility.granule_utils import RecordDictionaryTool
 from interface.objects import Granule, DeviceStatusType, DeviceCommsType, StatusType, StreamConfiguration
 from interface.objects import AgentCommand, ProcessDefinition, ProcessStateEnum
 from interface.objects import UserInfo, NotificationRequest
-
+from interface.objects import ComputedIntValue, ComputedFloatValue
 from ion.processes.bootstrap.index_bootstrap import STD_INDEXES
 from nose.plugins.attrib import attr
 import gevent
@@ -206,6 +206,20 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
         datastore = self.container.datastore_manager.get_datastore(datastore_name, DataStore.DS_PROFILE.SCIDATA)
         return datastore
 
+    def check_computed_attributes_of_extended_instrument(self, extended_instrument):
+
+        # Verify that computed attributes exist for the extended instrument
+        self.assertIsInstance(extended_instrument.computed.firmware_version, ComputedFloatValue)
+        self.assertIsInstance(extended_instrument.computed.last_data_received_datetime, ComputedFloatValue)
+        self.assertIsInstance(extended_instrument.computed.last_calibration_datetime, ComputedFloatValue)
+        self.assertIsInstance(extended_instrument.computed.uptime, ComputedIntValue)
+
+        self.assertIsInstance(extended_instrument.computed.power_status_roll_up, ComputedIntValue)
+        self.assertIsInstance(extended_instrument.computed.communications_status_roll_up, ComputedIntValue)
+        self.assertIsInstance(extended_instrument.computed.data_status_roll_up, ComputedIntValue)
+        self.assertIsInstance(extended_instrument.computed.location_status_roll_up, ComputedIntValue)
+
+
 
     @attr('LOCOINT')
     @unittest.skipIf(not use_es, 'No ElasticSearch')
@@ -299,6 +313,7 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
 
         data_product_id1 = self.dpclient.create_data_product(data_product=dp_obj, stream_definition_id=parsed_stream_def_id)
         print  'new dp_id = %s' % data_product_id1
+        self.dpclient.activate_data_product_persistence(data_product_id=data_product_id1)
 
         self.damsclient.assign_data_product(input_resource_id=instDevice_id, data_product_id=data_product_id1)
 
@@ -312,10 +327,7 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
         dataset_ids, _ = self.rrclient.find_objects(data_product_id1, PRED.hasDataset, RT.Dataset, True)
         print  'Data set for data_product_id1 = %s' % dataset_ids[0]
         self.parsed_dataset = dataset_ids[0]
-        #create the datastore at the beginning of each int test that persists data
-        self.get_datastore(self.parsed_dataset)
 
-        self.dpclient.activate_data_product_persistence(data_product_id=data_product_id1)
 
         pid = self.create_logger('ctd_parsed', stream_ids[0] )
         self.loggerpids.append(pid)
@@ -516,6 +528,10 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
 
         self.assertEqual( 1, len(extended_instrument.computed.user_notification_requests.value) )
 
+        # Verify that computed attributes exist for the extended instrument
+        self.check_computed_attributes_of_extended_instrument(extended_instrument)
+
+        # Verify the computed attribute for user notification requests
         notifications = extended_instrument.computed.user_notification_requests.value
         notification = notifications[0]
         self.assertEqual(notification.origin, instDevice_id)
@@ -579,9 +595,12 @@ class TestActivateInstrumentIntegration(IonIntegrationTestCase):
 
         extended_instrument = self.imsclient.get_instrument_device_extension(instrument_device_id=instDevice_id, user_id=user_id_2)
         log.debug( "For user_2: extended_instrument %s", str(extended_instrument) )
+        log.debug( "For user_2: extended_instrument.computed: %s", str(extended_instrument.computed) )
         log.debug( "For user_2: extended_instrument computed user_notification_requests %s", extended_instrument.computed.user_notification_requests.value)
 
         self.assertEqual( 1, len(extended_instrument.computed.user_notification_requests.value) )
+
+        self.check_computed_attributes_of_extended_instrument(extended_instrument)
 
         notifications = extended_instrument.computed.user_notification_requests.value
         notification = notifications[0]

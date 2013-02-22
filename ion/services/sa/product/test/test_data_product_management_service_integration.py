@@ -158,6 +158,7 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
 
         dp_id = self.dpsc_cli.create_data_product( data_product= dp_obj,
                                             stream_definition_id=ctd_stream_def_id)
+        self.dpsc_cli.activate_data_product_persistence(dp_id)
 
         dp_obj = self.dpsc_cli.read_data_product(dp_id)
         self.assertIsNotNone(dp_obj)
@@ -173,6 +174,7 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
             spatial_domain = sdom.dump())
 
         dp_id2 = self.dpsc_cli.create_data_product(dp_obj, ctd_stream_def_id)
+        self.dpsc_cli.activate_data_product_persistence(dp_id2)
         log.debug('new dp_id = %s' % dp_id2)
 
         #------------------------------------------------------------------------------------------------
@@ -238,6 +240,30 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
 
 #        self.assertTrue(len(events) > 0)
 
+    def test_data_product_stream_def(self):
+        pdict_id = self.dataset_management.read_parameter_dictionary_by_name('ctd_parsed_param_dict', id_only=True)
+        ctd_stream_def_id = self.pubsubcli.create_stream_definition(name='Simulated CTD data', parameter_dictionary_id=pdict_id)
+
+        tdom, sdom = time_series_domain()
+
+        sdom = sdom.dump()
+        tdom = tdom.dump()
+
+
+
+        dp_obj = IonObject(RT.DataProduct,
+            name='DP1',
+            description='some new dp',
+            temporal_domain = tdom,
+            spatial_domain = sdom)
+        dp_id = self.dpsc_cli.create_data_product(data_product= dp_obj,
+            stream_definition_id=ctd_stream_def_id)
+
+        stream_def_id = self.dpsc_cli.get_data_product_stream_definition(dp_id)
+        self.assertEquals(ctd_stream_def_id, stream_def_id)
+
+
+
     def test_activate_suspend_data_product(self):
 
         #------------------------------------------------------------------------------------------------
@@ -273,6 +299,11 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
         dp_id = self.dpsc_cli.create_data_product(data_product= dp_obj,
             stream_definition_id=ctd_stream_def_id)
 
+        #------------------------------------------------------------------------------------------------
+        # test activate and suspend data product persistence
+        #------------------------------------------------------------------------------------------------
+        self.dpsc_cli.activate_data_product_persistence(dp_id)
+        
         dp_obj = self.dpsc_cli.read_data_product(dp_id)
         self.assertIsNotNone(dp_obj)
 
@@ -281,10 +312,6 @@ class TestDataProductManagementServiceIntegration(IonIntegrationTestCase):
             raise NotFound("Data Product %s dataset  does not exist" % str(dp_id))
         self.get_datastore(dataset_ids[0])
 
-        #------------------------------------------------------------------------------------------------
-        # test activate and suspend data product persistence
-        #------------------------------------------------------------------------------------------------
-        self.dpsc_cli.activate_data_product_persistence(dp_id)
 
         # Check that the streams associated with the data product are persisted with
         stream_ids, _ =  self.rrclient.find_objects(dp_id,PRED.hasStream,RT.Stream,True)
