@@ -374,8 +374,9 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
 
         if log.isEnabledFor(TRACE):
             # report per step
-            for step in 'checks', 'insert', 'keys', 'save', 'notify':
-                log.debug('%s step %s times: %s', self._id, step, self.time_stats.to_string(step))
+            for step in 'load', 'lock', 'open', 'close', 'combine', 'insert', 'set':
+                if step in self.time_stats.count:
+                    log.debug('%s step %s times: %s', self._id, step, self.time_stats.to_string(step))
         # report totals
         log.debug('%s total times: %s', self._id, self.time_stats)
 
