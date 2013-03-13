@@ -28,44 +28,33 @@ import uuid
 
 REPORT_FREQUENCY=100
 MAX_RETRY_TIME=3600
-
+TIMESTAMP_KEY = 'ingestion_timestamp'
 class ScienceGranuleIngestionWorker(TransformStreamListener):
     CACHE_LIMIT=CFG.get_safe('container.ingestion_cache',5)
 
     def __init__(self, *args,**kwargs):
         super(ScienceGranuleIngestionWorker, self).__init__(*args, **kwargs)
-        #--------------------------------------------------------------------------------
-        # Ingestion Cache
-        # - Datasets
-        # - Coverage instances
-        #--------------------------------------------------------------------------------
-        self._datasets  = collections.OrderedDict()
-        self._coverages = collections.OrderedDict()
 
-        self._bad_coverages = {}
+        # cache values from multiple granules in dict { 'field': [ value, value, ... ], ... }
+        self._cached_values = {}
+        # cache times in number format -- convert to field type after we create coverage and see if they are needed
+        self._cached_times = []
+        # persist cache when list size >= this value (count of values, not count of granules)
+        self._checkpoint_frequency = 20
 
-        self.time_stats = Accumulator(format='%3f')
-        # unique ID to identify this worker in log msgs
-        self._id = uuid.uuid1()
-        self._cached_values = []
         self._stream_id = None
         self._lock = Lock()
-        self.checkpoint_frequency = 20
+        self._time_stats = Accumulator(format='%3f')
 
     def on_start(self): #pragma no cover
         super(ScienceGranuleIngestionWorker,self).on_start()
-        self.event_publisher = EventPublisher(OT.DatasetModified)
+        self._publisher = EventPublisher(OT.DatasetModified)
         self._running = True
 
     def on_quit(self): #pragma no cover
         self._running = False
         self._persist_cache()
         super(ScienceGranuleIngestionWorker, self).on_quit()
-#        for stream, coverage in self._coverages.iteritems():
-#            try:
-#                coverage.close(timeout=5)
-#            except:
-#                log.exception('Problems closing the coverage')
 
     def recv_packet(self, msg, stream_route, stream_id):
         ''' receive packet for ingestion '''
@@ -73,8 +62,10 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
         try:
             self._validate_stream(stream_id)
             self._add_to_cache(msg)
-            if len(self._cached_values) >= self.checkpoint_frequency:
+            # slightly hacky -- want len of the arrays in the dict, should always have the
+            if len(self._cached_values[TIMESTAMP_KEY]) >= self._checkpoint_frequency:
                 self._persist_cache()
+                self._publisher.publish_event(origin=dataset_id, author=self.id, extents=extents, window=window)
         except:
             log.error('failed to ingest granule', exc_info=True)
             raise
@@ -89,7 +80,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             self._dataset_id = ids[0]
             if log.isEnabledFor(DEBUG):
                 path = DatasetManagementService._get_coverage_path(self._dataset_id)
-                log.debug('%s: init stream %s, dataset %s, coverage %s', self._id, stream_id, self._dataset_id, path)
+                log.debug('%s: init stream %s, dataset %s, coverage %s', self.id, stream_id, self._dataset_id, path)
         elif self._stream_id != stream_id:
             raise Exception('expected stream %s, received granule from stream %s'%(self._stream_id, stream_id))
 
@@ -112,22 +103,21 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
         if debugging:
             timer.complete_step('load')
 
-        # each entry in cache is tuple (elements, { name: value }, timestamp )
-        count = len(rdt)
-        if not len(rdt):
-            log.debug('Empty granule for stream %s', self._stream_id)
-            return
-        contents = dict(rdt) # encode in simple dict rather than cache multiple copies of schema
-        for k,v in contents.iteritems():
-            if len(v)!=count:
-                raise Exception('received granule size %d, but key %s had %d values' % (count,k,len(v)))
-        cache_entry = (count, contents, time.time())
-        with self._lock:
-            if debugging:
-                timer.complete_step('lock')
-            if not self._running:
-                raise Exception('process no longer running, will drop this granule')
-            self._cached_values.append(cache_entry)
+        # for all fields we've already seen, add values to lists in cache
+        granule_size = len(rdt)
+        for known_key in self._cached_values.iterkeys():
+            if known_key in rdt:
+                self._cached_values[known_key] += rdt[known_key]
+            else:
+                self._cached_values[known_key] += [None]*granule_size
+        # if there are any new fields, update cache with nulls then add current granule values
+        cache_size = len(self._cached_values[TIMESTAMP_KEY])
+        for granule_key in rdt.iterkeys():
+            if granule_key not in self._cached_values:
+                self._cached_values[granule_key] = [None]*cache_size + rdt[granule_key]
+        # add timestamps
+        time = time.time()
+        self._cached_times += [time]*granule_size
 
     def _persist_cache(self):
         """ write cached granules to disk """
@@ -136,7 +126,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
         if debugging:
             path = DatasetManagementService._get_coverage_path(self._dataset_id)
             log.debug('%s: add_granule stream %s dataset %s file %s',
-                self._id, self._stream_id, self._dataset_id, path)
+                self.id, self._stream_id, self._dataset_id, path)
 
         coverage = DatasetManagementService._get_coverage(self._dataset_id, mode='a')
         if debugging:
@@ -157,43 +147,27 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             self._add_timing_stats(timer)
 
     def _add_cache_to_coverage(self, coverage, timer):
-        # TODO: instead of None, use parameter dictionary fill value
-        size = 0
-        value_lists = { }
-        add_time = 'ingestion_timestamp' in coverage.list_parameters()
-        time_list = [ ]
-        for n,d,t in self._cached_values:
-            # if this granule had any keys not already seen, add list of None for values from previous granules
-            for k,v in d.iteritems():
-                if k not in value_lists:
-                    value_lists[k] = [ None ] * size
-            # for all known keys, add values (if in current granule) or Nones (if not in current granule)
-            for k,v in value_lists.iteritems():
-                if k in d:
-                    v += d[k]
-                else:
-                    v += [None]*n
-            if add_time:
-                value = TimeUtils.ts_to_units(coverage.get_parameter_context('ingestion_timestamp').uom, t)
-                time_list += [value]*n
-            size += n
-        if add_time:
-            value_lists['ingestion_timestamp'] = time_list
-        if timer:
-            timer.complete_step('combine')
-
+        size = len(self._cached_times)
         coverage.insert_timesteps(size, oob=False)
         if timer:
             timer.complete_step('insert')
 
         start_index = coverage.num_timesteps - size
-
         slice_ = slice(start_index, None)
-        for k,v in value_lists.iteritems():
+        for k,v in self._cached_values.iteritems():
             coverage.set_parameter_values(param_name=k, tdoa=slice_, value=v)
+        if TIMESTAMP_KEY in coverage.list_parameters():
+            timestamps = []
+            last_time = None
+            for t in self._cached_times:
+                if t != last_time:
+                    value = TimeUtils.ts_to_units(coverage.get_parameter_context(TIMESTAMP_KEY).uom, t)
+                    last_time = t
+                timestamps.append(value)
+            coverage.set_parameter_values(param_name=TIMESTAMP_KEY, tdoa=slice_, value=timestamps)
         if timer:
             timer.complete_step('set')
-#
+
 ############################################################################
 #
 #    def _new_dataset(self, stream_id):
@@ -241,7 +215,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
 #        return result
 #
 #    def dataset_changed(self, dataset_id, extents, window):
-#        self.event_publisher.publish_event(origin=dataset_id, author=self.id, extents=extents, window=window)
+#        self._publisher.publish_event(origin=dataset_id, author=self.id, extents=extents, window=window)
 #
 #    @handle_stream_exception()
 #    def xxrecv_packet(self, msg, stream_route, stream_id):
@@ -318,7 +292,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
 #        if debugging:
 #            path = DatasetManagementService._get_coverage_path(dataset_id)
 #            log.debug('%s: add_granule stream %s dataset %s coverage %r file %s',
-#                      self._id, stream_id, dataset_id, coverage, path)
+#                      self.id, stream_id, dataset_id, coverage, path)
 #
 #        if not coverage:
 #            log.error('Could not persist coverage from granule, coverage is None')
@@ -372,16 +346,16 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
 
     def _add_timing_stats(self, timer):
         """ add stats from latest coverage operation to Accumulator and periodically log results """
-        self.time_stats.add(timer)
-        if self.time_stats.get_count('load') % REPORT_FREQUENCY>0:
+        self._time_stats.add(timer)
+        if self._time_stats.get_count('load') % REPORT_FREQUENCY>0:
             return
 
         if log.isEnabledFor(TRACE):
             # report per step
-            for step in 'load', 'lock', 'open', 'close', 'combine', 'insert', 'set':
-                if step in self.time_stats.count:
-                    log.debug('%s step %s times: %s', self._id, step, self.time_stats.to_string(step))
+            for step in 'load', 'lock', 'open', 'combine', 'insert', 'set', 'close':
+                if step in self._time_stats.count:
+                    log.debug('%s step %s times: %s', self.id, step, self._time_stats.to_string(step))
         # report totals
-        log.debug('%s total times: %s', self._id, self.time_stats)
+        log.debug('%s total times: %s', self.id, self._time_stats)
 
 
