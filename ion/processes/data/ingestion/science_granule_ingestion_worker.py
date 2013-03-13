@@ -70,10 +70,14 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
     def recv_packet(self, msg, stream_route, stream_id):
         ''' receive packet for ingestion '''
         log.trace('received granule for stream %s', stream_id)
-        self._validate_stream(stream_id)
-        self._add_to_cache(msg)
-        if len(self._cached_values) >= self.checkpoint_frequency:
-            self._persist_cache()
+        try:
+            self._validate_stream(stream_id)
+            self._add_to_cache(msg)
+            if len(self._cached_values) >= self.checkpoint_frequency:
+                self._persist_cache()
+        except:
+            log.error('failed to ingest granule', exc_info=True)
+            raise
 
     def _validate_stream(self, stream_id):
         if not self._stream_id:
@@ -103,7 +107,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             return
         rdt = RecordDictionaryTool.load_from_granule(msg)
         if rdt is None:
-            log.error('Invalid granule (no RDT) for stream %s', stream_id)
+            log.error('Invalid granule (no RDT) for stream %s', self._stream_id)
             return
         if debugging:
             timer.complete_step('load')
@@ -111,7 +115,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
         # each entry in cache is tuple (elements, { name: value }, timestamp )
         count = len(rdt)
         if not len(rdt):
-            log.debug('Empty granule for stream %s', stream_id)
+            log.debug('Empty granule for stream %s', self._stream_id)
             return
         contents = dict(rdt) # encode in simple dict rather than cache multiple copies of schema
         for k,v in contents.iteritems():
@@ -130,9 +134,9 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
         debugging = log.isEnabledFor(DEBUG)
         timer = Timer('persist') if debugging else None
         if debugging:
-            path = DatasetManagementService._get_coverage_path(dataset_id)
-            log.debug('%s: add_granule stream %s dataset %s coverage %r file %s',
-                self._id, stream_id, dataset_id, coverage, path)
+            path = DatasetManagementService._get_coverage_path(self._dataset_id)
+            log.debug('%s: add_granule stream %s dataset %s file %s',
+                self._id, self._stream_id, self._dataset_id, path)
 
         coverage = DatasetManagementService._get_coverage(self._dataset_id, mode='a')
         if debugging:
