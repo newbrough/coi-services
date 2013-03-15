@@ -5,6 +5,7 @@
 @author  Maurice Manning
 """
 from uuid import uuid4
+from ion.util.enhanced_resource_registry_client import EnhancedResourceRegistryClient
 
 from pyon.util.log import log
 from pyon.util.ion_time import IonTime
@@ -62,6 +63,8 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         Replaces the service clients with a new set of them... and makes sure they go to the right places
         """
 
+        self.RR2 = EnhancedResourceRegistryClient(self.clients.resource_registry)
+
         #shortcut names for the import sub-services
         if hasattr(self.clients, "resource_registry"):
             self.RR   = self.clients.resource_registry
@@ -107,33 +110,25 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         '''
         Creates a new transform function
         '''
-        tfs, _ = self.clients.resource_registry.find_resources(name=transform_function.name, restype=RT.TransformFunction, id_only=False)
-        if len(tfs):
-            for tf in tfs:
-                if self._cmp_transform_function(transform_function, tf):
-                    return tf._id
-            raise BadRequest('An existing TransformFunction with name %s exists with a different definition' % transform_function.name)
 
-        tf_id, rev = self.clients.resource_registry.create(transform_function)
-        return tf_id
+        return self.RR2.create(transform_function, RT.TransformFunction)
 
     def read_transform_function(self, transform_function_id=''):
-        tf = self.clients.resource_registry.read(transform_function_id)
-        validate_is_instance(tf,TransformFunction, 'Resource %s is not a TransformFunction: %s' %(transform_function_id, type(tf)))
+        tf = self.RR2.read(transform_function_id, RT.TransformFunction)
         return tf
 
+    def update_transform_function(self, transform_function=None):
+        self.RR2.update(transform_function, RT.TransformFunction)
+
     def delete_transform_function(self, transform_function_id=''):
-        self.read_transform_function(transform_function_id)
-        self.clients.resource_registry.delete(transform_function_id)
-        
+        self.RR2.retire(transform_function_id, RT.TransformFunction)
+
+    def force_delete_transform_function(self, transform_function_id=''):
+        self.RR2.pluck_delete(transform_function_id, RT.TransformFunction)
+
     def create_data_process_definition(self, data_process_definition=None):
 
-        result, _ = self.clients.resource_registry.find_resources(RT.DataProcessDefinition, None, data_process_definition.name, True)
-
-        validate_true( len(result) ==0, "A data process definition named '%s' already exists" % data_process_definition.name)
-
-        #todo: determine validation checks for a data process def
-        data_process_definition_id, version = self.clients.resource_registry.create(data_process_definition)
+        data_process_definition_id = self.RR2.create(data_process_definition, RT.DataProcessDefinition)
 
         #-------------------------------
         # Process Definition
@@ -146,7 +141,7 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         process_definition.executable = {'module':data_process_definition.module, 'class':data_process_definition.class_name}
         process_definition_id = self.clients.process_dispatcher.create_process_definition(process_definition=process_definition)
 
-        self.clients.resource_registry.create_association(data_process_definition_id, PRED.hasProcessDefinition, process_definition_id)
+        self.RR2.assign_process_definition_to_data_process_definition(process_definition_id, data_process_definition_id)
 
         return data_process_definition_id
 
@@ -154,25 +149,23 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         # TODO: If executable has changed, update underlying ProcessDefinition
 
         # Overwrite DataProcessDefinition object
-        self.clients.resource_registry.update(data_process_definition)
+        self.RR2.update(data_process_definition, RT.DataProcessDefinition)
 
     def read_data_process_definition(self, data_process_definition_id=''):
-        data_proc_def_obj = self.clients.resource_registry.read(data_process_definition_id)
+        data_proc_def_obj = self.RR2.read(data_process_definition_id, RT.DataProcessDefinition)
         return data_proc_def_obj
 
     def delete_data_process_definition(self, data_process_definition_id=''):
 
-        # Delete all associations for this resource
-        self._remove_associations(data_process_definition_id)
-
         # Delete the resource
-        self.clients.resource_registry.retire(data_process_definition_id)
+        self.RR2.retire(data_process_definition_id, RT.DataProcessDefinition)
 
     def force_delete_data_process_definition(self, data_process_definition_id=''):
 
         processdef_ids, _ = self.clients.resource_registry.find_objects(subject=data_process_definition_id, predicate=PRED.hasProcessDefinition, object_type=RT.ProcessDefinition, id_only=True)
-        self._remove_associations(data_process_definition_id)
-        self.clients.resource_registry.delete(data_process_definition_id)
+
+        self.RR2.pluck_delete(data_process_definition_id, RT.DataProcessDefinition)
+
         for processdef_id in processdef_ids:
             self.clients.process_dispatcher.delete_process_definition(processdef_id)
 
@@ -266,6 +259,7 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         '''
         configuration = configuration or DotDict()
         routes = configuration.get_safe('process.routes', {})
+
         self.validate_compatibility(in_data_product_ids, out_data_product_ids)
         configuration.process.routes = self._manage_routes(routes)
 
@@ -276,6 +270,9 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         dproc._id = dproc_id
         dproc._rev = rev
 
+        for data_product_id in in_data_product_ids:
+            self.clients.resource_registry.create_association(subject=dproc_id, predicate=PRED.hasInputProduct, object=data_product_id)
+        
         self._manage_producers(dproc_id, out_data_product_ids)
 
         self._manage_attachments()
@@ -631,30 +628,28 @@ class DataProcessManagementService(BaseDataProcessManagementService):
 
         #Stops processes and deletes the data process associations
         #TODO: Delete the processes also?
-        assocs = self.clients.resource_registry.find_associations(subject=data_process_id, predicate=RT.hasProcess, id_only=False)
-        for assoc in assocs:
-            self._stop_process(data_process=assoc.o)
+        self.deactivate_data_process2(data_process_id)
+        processes, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasProcess, id_only=False)
+        for process, assoc in zip(processes,assocs):
+            self._stop_process(data_process=process)
             self.clients.resource_registry.delete_association(assoc)
 
         #Delete all subscriptions associations
-        assocs = self.clients.resource_registry.find_associations(subject=data_process_id, predicate=RT.hasSubscription, id_only=False)
-        for assoc in assocs:
-            #Delete subscription
-            self.clients.pubsub_management.deactivate_subscription(subscription_id=assoc.o._id)
-            self.clients.pubsub_management.delete_subscription(subscription_id=assoc.o._id)
-
+        subscription_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasSubscription, id_only=True)
+        for subscription_id, assoc in zip(subscription_ids, assocs):
             self.clients.resource_registry.delete_association(assoc)
+            self.clients.pubsub_management.delete_subscription(subscription_id)
 
         #Unassign data products
-        assocs = self.clients.resource_registry.find_associations(subject=data_process_id, predicate=RT.hasOutputProduct, id_only=False)
-        for assoc in assocs:
-            self.clients.data_acquisition_management.unassign_data_product(input_resource_id=data_process_id, data_product_id=assoc.o._id)
+        data_product_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasOutputProduct, id_only=True)
+        for data_product_id, assoc in zip(data_product_ids, assocs):
+            self.clients.data_acquisition_management.unassign_data_product(input_resource_id=data_process_id, data_product_id=data_product_id)
 
         #Unregister the data process with acquisition
         self.clients.data_acquisition_management.unregister_process(data_process_id=data_process_id)
 
         #Delete the data process from the resource registry
-        self.clients.resource_registry.delete(object_id=data_process_id)
+        self.RR2.retire(data_process_id, RT.DataProcess)
 
     def force_delete_data_process(self, data_process_id=""):
 
@@ -663,8 +658,7 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         if dp_obj.lcstate != LCS.RETIRED:
             self.delete_data_process(data_process_id)
 
-        self._remove_associations(data_process_id)
-        self.clients.resource_registry.delete(data_process_id)
+        self.RR2.pluck_delete(data_process_id, RT.DataProcess)
 
     def _stop_process(self, data_process):
         log.debug("stopping data process '%s'" % data_process.process_id)
@@ -682,6 +676,23 @@ class DataProcessManagementService(BaseDataProcessManagementService):
         data_process_list , _ = self.clients.resource_registry.find_resources(RT.DataProcess, None, None, True)
         return data_process_list
 
+    def activate_data_process2(self, data_process_id=''):
+        #@Todo: Data Process Producer context stuff
+        subscription_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasSubscription, id_only=True)
+        for subscription_id in subscription_ids:
+            if not self.clients.pubsub_management.subscription_is_active(subscription_id):
+                self.clients.pubsub_management.activate_subscription(subscription_id)
+        return True
+
+    def deactivate_data_process2(self, data_process_id=''):
+        #@todo: data process producer context stuff
+        subscription_ids, assocs = self.clients.resource_registry.find_objects(subject=data_process_id, predicate=PRED.hasSubscription, id_only=True)
+        for subscription_id in subscription_ids:
+            if self.clients.pubsub_management.subscription_is_active(subscription_id):
+                self.clients.pubsub_management.deactivate_subscription(subscription_id)
+
+        return True
+    
     def activate_data_process(self, data_process_id=""):
 
         data_process_obj = self.read_data_process(data_process_id)
@@ -929,34 +940,3 @@ class DataProcessManagementService(BaseDataProcessManagementService):
 
         return extended_data_process
 
-
-    def _remove_associations(self, resource_id=''):
-        """
-        delete all associations to/from a resource
-        """
-
-        # find all associations where this is the subject
-        _, obj_assns = self.clients.resource_registry.find_objects(subject=resource_id, id_only=True)
-
-        # find all associations where this is the object
-        _, sbj_assns = self.clients.resource_registry.find_subjects(object=resource_id, id_only=True)
-
-        log.debug("pluck will remove %s subject associations and %s object associations",
-                 len(sbj_assns), len(obj_assns))
-
-        for assn in obj_assns:
-            log.debug("pluck deleting object association %s", assn)
-            self.clients.resource_registry.delete_association(assn)
-
-        for assn in sbj_assns:
-            log.debug("pluck deleting subject association %s", assn)
-            self.clients.resource_registry.delete_association(assn)
-
-        # find all associations where this is the subject
-        _, obj_assns = self.clients.resource_registry.find_objects(subject=resource_id, id_only=True)
-
-        # find all associations where this is the object
-        _, sbj_assns = self.clients.resource_registry.find_subjects(object=resource_id, id_only=True)
-
-        log.debug("post-deletions, pluck found %s subject associations and %s object associations",
-                 len(sbj_assns), len(obj_assns))
