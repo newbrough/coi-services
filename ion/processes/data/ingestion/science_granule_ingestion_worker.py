@@ -110,7 +110,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             else:
                 self._cached_values[known_key] += [None]*granule_size
         # if there are any new fields, update cache with nulls then add current granule values
-        cache_size = len(self._cached_values[TIMESTAMP_KEY])
+        cache_size = len(self._cached_times)
         for granule_key in rdt.iterkeys():
             if granule_key not in self._cached_values:
                 self._cached_values[granule_key] = [None]*cache_size + rdt[granule_key]
@@ -151,8 +151,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             timer.complete_step('notify')
             self._add_timing_stats(timer)
 
-
-def _add_cache_to_coverage(self, coverage, timer):
+    def _add_cache_to_coverage(self, coverage, timer):
         size = len(self._cached_times)
         coverage.insert_timesteps(size, oob=False)
         if timer:
@@ -174,182 +173,6 @@ def _add_cache_to_coverage(self, coverage, timer):
         if timer:
             timer.complete_step('set')
         return start_index
-
-############################################################################
-#
-#    def _new_dataset(self, stream_id):
-#        '''
-#        Adds a new dataset to the internal cache of the ingestion worker
-#        '''
-#        rr_client = ResourceRegistryServiceClient()
-#        datasets, _ = rr_client.find_subjects(subject_type=RT.Dataset,predicate=PRED.hasStream,object=stream_id,id_only=True)
-#        if datasets:
-#            return datasets[0]
-#        return None
-#
-#    def get_dataset(self,stream_id):
-#        '''
-#        Memoization (LRU) of _new_dataset
-#        '''
-#        try:
-#            result = self._datasets.pop(stream_id)
-#        except KeyError:
-#            result = self._new_dataset(stream_id)
-#            if result is None:
-#                return None
-#            if len(self._datasets) >= self.CACHE_LIMIT:
-#                self._datasets.popitem(0)
-#        self._datasets[stream_id] = result
-#        return result
-#
-#    def get_coverage(self, stream_id):
-#        '''
-#        Memoization (LRU) of _get_coverage
-#        '''
-#        try:
-#            result = self._coverages.pop(stream_id)
-#        except KeyError:
-#            dataset_id = self.get_dataset(stream_id)
-#            if dataset_id is None:
-#                return None
-#            result = DatasetManagementService._get_coverage(dataset_id, mode='a')
-#            if result is None:
-#                return None
-#            if len(self._coverages) >= self.CACHE_LIMIT:
-#                k, coverage = self._coverages.popitem(0)
-#                coverage.close(timeout=5)
-#        self._coverages[stream_id] = result
-#        return result
-#
-#    def dataset_changed(self, dataset_id, extents, window):
-#        self._publisher.publish_event(origin=dataset_id, author=self.id, extents=extents, window=window)
-#
-#    @handle_stream_exception()
-#    def xxrecv_packet(self, msg, stream_route, stream_id):
-#        ''' receive packet for ingestion '''
-#        log.trace('received granule for stream %s', stream_id)
-#
-#        if msg == {}:
-#            log.error('Received empty message from stream: %s', stream_id)
-#            return
-#        # Message validation
-#        if not isinstance(msg, Granule):
-#            log.error('Ingestion received a message that is not a granule: %s', msg)
-#            return
-#
-#        rdt = RecordDictionaryTool.load_from_granule(msg)
-#        if rdt is None:
-#            log.error('Invalid granule (no RDT) for stream %s', stream_id)
-#            return
-#        if not len(rdt):
-#            log.debug('Empty granule for stream %s', stream_id)
-#            return
-#
-#        self.persist_or_timeout(stream_id, rdt)
-#
-#    def persist_or_timeout(self, stream_id, rdt):
-#        """ retry writing coverage multiple times and eventually time out """
-#        done = False
-#        timeout = 2
-#        start = time.time()
-#        while not done:
-#            try:
-#                self.add_granule(stream_id, rdt)
-#                done = True
-#            except:
-#                log.exception('An issue with coverage, retrying after a bit')
-#                if (time.time() - start) > MAX_RETRY_TIME: # After an hour just give up
-#                    dataset_id = self.get_dataset(stream_id)
-#                    log.error("We're giving up, the coverage needs to be inspected %s", DatasetManagementService._get_coverage_path(dataset_id))
-#                    raise
-#
-#                if stream_id in self._coverages:
-#                    log.info('Popping coverage for stream %s', stream_id)
-#                    self._coverages.pop(stream_id)
-#
-#                gevent.sleep(timeout)
-#                if timeout > (60 * 5):
-#                    timeout = 60 * 5
-#                else:
-#                    timeout *= 2
-#
-#    def add_granule(self,stream_id, rdt):
-#        ''' Appends the granule's data to the coverage and persists it. '''
-#        debugging = log.isEnabledFor(DEBUG)
-#        timer = Timer() if debugging else None
-#        if stream_id in self._bad_coverages:
-#            log.info('Message attempting to be inserted into bad coverage: %s',
-#                     DatasetManagementService._get_coverage_path(self.get_dataset(stream_id)))
-#
-#
-#        #--------------------------------------------------------------------------------
-#        # Coverage determiniation and appending
-#        #--------------------------------------------------------------------------------
-#        dataset_id = self.get_dataset(stream_id)
-#        if not dataset_id:
-#            log.error('No dataset could be determined on this stream: %s', stream_id)
-#            return
-#        try:
-#            coverage = self.get_coverage(stream_id)
-#        except IOError as e:
-#            log.error("Couldn't open coverage: %s",
-#                      DatasetManagementService._get_coverage_path(self.get_dataset(stream_id)))
-#            raise CorruptionError(e.message)
-#
-#        if debugging:
-#            path = DatasetManagementService._get_coverage_path(dataset_id)
-#            log.debug('%s: add_granule stream %s dataset %s coverage %r file %s',
-#                      self.id, stream_id, dataset_id, coverage, path)
-#
-#        if not coverage:
-#            log.error('Could not persist coverage from granule, coverage is None')
-#            return
-#        #--------------------------------------------------------------------------------
-#        # Actual persistence
-#        #--------------------------------------------------------------------------------
-#        elements = len(rdt)
-#        if debugging:
-#            timer.complete_step('checks') # lightweight ops, should be zero
-#        try:
-#            coverage.insert_timesteps(elements, oob=False)
-#        except IOError as e:
-#            log.error("Couldn't insert time steps for coverage: %s",
-#                      DatasetManagementService._get_coverage_path(self.get_dataset(stream_id)), exc_info=True)
-#            try:
-#                coverage.close()
-#            finally:
-#                self._bad_coverages[stream_id] = 1
-#                raise CorruptionError(e.message)
-#        if debugging:
-#            timer.complete_step('insert')
-#
-#        start_index = coverage.num_timesteps - elements
-#
-#        for k,v in rdt.iteritems():
-#            slice_ = slice(start_index, None)
-#            try:
-#                coverage.set_parameter_values(param_name=k, tdoa=slice_, value=v)
-#            except IOError as e:
-#                log.error("Couldn't insert values for coverage: %s",
-#                          DatasetManagementService._get_coverage_path(self.get_dataset(stream_id)), exc_info=True)
-#                try:
-#                    coverage.close()
-#                finally:
-#                    self._bad_coverages[stream_id] = 1
-#                    raise CorruptionError(e.message)
-#        if 'ingestion_timestamp' in coverage.list_parameters():
-#            t_now = time.time()
-#            ntp_time = TimeUtils.ts_to_units(coverage.get_parameter_context('ingestion_timestamp').uom, t_now)
-#            coverage.set_parameter_values(param_name='ingestion_timestamp', tdoa=slice_, value=ntp_time)
-#        if debugging:
-#            timer.complete_step('keys')
-#        DatasetManagementService._save_coverage(coverage)
-#        if debugging:
-#            timer.complete_step('save')
-#        self.dataset_changed(dataset_id,coverage.num_timesteps,(start_index,start_index+elements))
-#        if debugging:
-#            timer.complete_step('notify')
-#            self._add_timing_stats(timer)
 
     def _add_timing_stats(self, timer):
         """ add stats from latest coverage operation to Accumulator and periodically log results """
