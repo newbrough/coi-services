@@ -63,9 +63,8 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             self._validate_stream(stream_id)
             self._add_to_cache(msg)
             # slightly hacky -- want len of the arrays in the dict, should always have the
-            if len(self._cached_values[TIMESTAMP_KEY]) >= self._checkpoint_frequency:
+            if len(self._cached_times) >= self._checkpoint_frequency:
                 self._persist_cache()
-                self._publisher.publish_event(origin=dataset_id, author=self.id, extents=extents, window=window)
         except:
             log.error('failed to ingest granule', exc_info=True)
             raise
@@ -133,20 +132,27 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             timer.complete_step('open')
         try:
             with self._lock:
-                self._add_cache_to_coverage(coverage, timer)
+                start_index = self._add_cache_to_coverage(coverage, timer)
                 self._cached_values.clear()
         except:
             raise CorruptionError('failed to write coverage')
         finally:
             try:
+                extents = coverage.num_timesteps
                 coverage.close()
             except:
                 raise CorruptionError('failed to close coverage')
         if debugging:
             timer.complete_step('close')
+
+        log.debug('publishing ingestion event %s, %s, %s', self._dataset_id, start_index, extents)
+        self._publisher.publish_event(origin=self._dataset_id, author=self.id, extents=extents, window=(start_index,extents))
+        if debugging:
+            timer.complete_step('notify')
             self._add_timing_stats(timer)
 
-    def _add_cache_to_coverage(self, coverage, timer):
+
+def _add_cache_to_coverage(self, coverage, timer):
         size = len(self._cached_times)
         coverage.insert_timesteps(size, oob=False)
         if timer:
@@ -167,6 +173,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
             coverage.set_parameter_values(param_name=TIMESTAMP_KEY, tdoa=slice_, value=timestamps)
         if timer:
             timer.complete_step('set')
+        return start_index
 
 ############################################################################
 #
@@ -352,7 +359,7 @@ class ScienceGranuleIngestionWorker(TransformStreamListener):
 
         if log.isEnabledFor(TRACE):
             # report per step
-            for step in 'load', 'lock', 'open', 'combine', 'insert', 'set', 'close':
+            for step in 'load', 'lock', 'open', 'combine', 'insert', 'set', 'close', 'notify':
                 if step in self._time_stats.count:
                     log.debug('%s step %s times: %s', self.id, step, self._time_stats.to_string(step))
         # report totals
